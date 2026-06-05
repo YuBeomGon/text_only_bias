@@ -27,6 +27,7 @@ class KVBias(nn.Module):
         length: int = 1500,
         M: int = 32,
         init_std: float = 0.02,
+        use_gate: bool = False,
     ):
         super().__init__()
         if mode not in ("A", "B"):
@@ -40,16 +41,33 @@ class KVBias(nn.Module):
         self.B_V = nn.ParameterList(
             [nn.Parameter(torch.randn(self.L, embed_dim) * init_std) for _ in range(num_layers)]
         )
+        # ---- gating (paper eq.3): B_gated = tanh(W_g.B) ⊙ B, per-layer W_g [d,d]
+        # W_g zero-initialized => gate starts CLOSED (tanh(0)=0 -> B_gated=0), so
+        # training begins from baseline behavior and learns to open the gate onto
+        # the scale-matched init underneath. One W_g per layer, shared by K and V.
+        self.use_gate = use_gate
+        if use_gate:
+            self.W_g = nn.ModuleList(
+                [nn.Linear(embed_dim, embed_dim, bias=False) for _ in range(num_layers)]
+            )
+            for w in self.W_g:
+                nn.init.zeros_(w.weight)
         self._handles = []
         # runtime state read by hooks: "train" | "A" | "B"
         self._runtime = {"mode": "train", "alpha": 1.0, "g": 1.0}
+
+    def gated(self, B, layer_idx: int = 0):
+        """Apply tanh gate (eq.3): B_gated = tanh(W_g_l · B) ⊙ B. No-op if disabled."""
+        if not self.use_gate:
+            return B
+        return torch.tanh(self.W_g[layer_idx](B)) * B
 
     # ---- hooks ----------------------------------------------------------
     def _make_hook(self, layer_idx: int, which: str):
         params = self.B_K if which == "K" else self.B_V
 
         def hook(module, inputs, output):
-            B = params[layer_idx]
+            B = self.gated(params[layer_idx], layer_idx)
             bsz = output.shape[0]
             Bb = B.unsqueeze(0).expand(bsz, -1, -1).to(output.dtype).to(output.device)
             rt = self._runtime
@@ -104,16 +122,17 @@ class KVBias(nn.Module):
 
     # ---- persistence ----------------------------------------------------
     def save(self, path) -> None:
-        torch.save(
-            {
-                "mode": self.mode,
-                "L": self.L,
-                "embed_dim": self.embed_dim,
-                "B_K": [p.detach().cpu() for p in self.B_K],
-                "B_V": [p.detach().cpu() for p in self.B_V],
-            },
-            path,
-        )
+        state = {
+            "mode": self.mode,
+            "L": self.L,
+            "embed_dim": self.embed_dim,
+            "use_gate": self.use_gate,
+            "B_K": [p.detach().cpu() for p in self.B_K],
+            "B_V": [p.detach().cpu() for p in self.B_V],
+        }
+        if self.use_gate:
+            state["W_g"] = [w.weight.detach().cpu() for w in self.W_g]
+        torch.save(state, path)
 
     def load(self, path) -> None:
         state = torch.load(path, map_location="cpu")
@@ -122,3 +141,6 @@ class KVBias(nn.Module):
                 p.copy_(q)
             for p, q in zip(self.B_V, state["B_V"]):
                 p.copy_(q)
+            if self.use_gate and state.get("W_g") is not None:
+                for w, q in zip(self.W_g, state["W_g"]):
+                    w.weight.copy_(q)

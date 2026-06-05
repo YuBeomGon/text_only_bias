@@ -15,6 +15,7 @@ import torch
 
 from ..exp02_kv_bias.kv_bias_model import KVBias
 from ..exp02_kv_bias.train import kv_text_only_loss
+from .loss import bregman_weighted_loss, build_domain_token_ids
 
 
 def _init_features(cfg, model, processor, k, device):
@@ -28,8 +29,8 @@ def _init_features(cfg, model, processor, k, device):
     return torch.stack(feats).to(device)
 
 
-def train(cfg, init_samples=16, decoder="none", limit_train=None, max_steps=None,
-          lr=None, out_name=None, device=None):
+def train(cfg, init_samples=16, decoder="none", use_gate=False, lambda_bd=0.0,
+          limit_train=None, max_steps=None, lr=None, out_name=None, device=None):
     from torch.optim import AdamW
     from torch.utils.data import DataLoader
     from transformers import get_linear_schedule_with_warmup
@@ -42,7 +43,8 @@ def train(cfg, init_samples=16, decoder="none", limit_train=None, max_steps=None
     tcfg = cfg["training"]
     kcfg = cfg.get("kv_bias", {})
     lr = lr if lr is not None else kcfg.get("learning_rate", 3e-4)
-    out_name = out_name or f"exp03_A_{decoder}.pt"
+    suffix = decoder + ("_gate" if use_gate else "") + (f"_bd{lambda_bd:g}" if lambda_bd else "")
+    out_name = out_name or f"exp03_A_{suffix}.pt"
     torch.manual_seed(tcfg.get("seed", 42))
 
     model, processor = build_frozen_model(cfg, device)
@@ -53,7 +55,10 @@ def train(cfg, init_samples=16, decoder="none", limit_train=None, max_steps=None
         mode="A",
         length=kcfg.get("length", 1500),
         init_std=kcfg.get("init_std", 0.02),
+        use_gate=use_gate,
     ).to(device)
+    if use_gate:
+        print("[exp03] tanh gating enabled (eq.3)", flush=True)
 
     # #1 E_pretrained init (paper eq.4) — audio used as seed only
     print(f"[exp03] E_pretrained init from {init_samples} train-audio clips (seed only)", flush=True)
@@ -79,6 +84,15 @@ def train(cfg, init_samples=16, decoder="none", limit_train=None, max_steps=None
     texts = list(train_ds[cfg["dataset"]["text_column"]])
     if limit_train:
         texts = texts[:limit_train]
+
+    # Bregman: domain token ids from TRAIN text only (leakage guard)
+    domain_ids = set()
+    if lambda_bd:
+        from ..common.metrics import build_domain_terms
+        domain_ids = build_domain_token_ids(build_domain_terms(texts), processor.tokenizer)
+        print(f"[exp03] Bregman loss enabled (eq.8) lambda_bd={lambda_bd}, "
+              f"|D_tokens|={len(domain_ids)}", flush=True)
+
     collator = TextOnlyCollator(
         processor, cfg["model"]["language"], cfg["model"]["task"], tcfg["max_label_length"]
     )
@@ -96,7 +110,8 @@ def train(cfg, init_samples=16, decoder="none", limit_train=None, max_steps=None
         for batch in loader:
             din = batch["decoder_input_ids"].to(device)
             lab = batch["labels"].to(device)
-            loss, _ = kv_text_only_loss(model, bias, din, lab)
+            ce_loss, logits = kv_text_only_loss(model, bias, din, lab)
+            loss = bregman_weighted_loss(logits, lab, domain_ids, lambda_bd) if lambda_bd else ce_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, tcfg["max_grad_norm"])
             opt.step()
@@ -127,13 +142,16 @@ def _main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--init-samples", type=int, default=16)
     ap.add_argument("--decoder", choices=["none", "full"], default="none")
+    ap.add_argument("--use-gate", action="store_true", help="enable tanh gating (eq.3)")
+    ap.add_argument("--lambda-bd", type=float, default=0.0,
+                    help="Bregman domain-word loss weight (eq.8); 0 = plain CE")
     ap.add_argument("--limit-train", type=int, default=None)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--out-name", default=None)
     args = ap.parse_args()
-    train(load_config(args.config), args.init_samples, args.decoder, args.limit_train,
-          args.max_steps, args.lr, args.out_name)
+    train(load_config(args.config), args.init_samples, args.decoder, args.use_gate,
+          args.lambda_bd, args.limit_train, args.max_steps, args.lr, args.out_name)
 
 
 if __name__ == "__main__":

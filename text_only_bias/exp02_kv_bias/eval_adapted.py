@@ -28,12 +28,14 @@ def run_kv_adapted(cfg, ckpt, mode, limit_test=None, device=None, out_name=None,
     out_name = out_name or f"kv_adapted_{mode}_grid.jsonl"
 
     model, processor = build_frozen_model(cfg, device)
+    use_gate = bool(torch.load(ckpt, map_location="cpu").get("use_gate", False))  # auto-detect
     bias = KVBias(
         num_layers=model.config.decoder_layers,
         embed_dim=model.config.d_model,
         mode=mode,
         length=kcfg.get("length", 1500),
         M=kcfg.get("M", 32),
+        use_gate=use_gate,
     ).to(device)
     bias.load(ckpt)
     bias = bias.to(device)
