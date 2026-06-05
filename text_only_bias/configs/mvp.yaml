@@ -1,0 +1,62 @@
+model:
+  name_or_path: openai/whisper-small
+  language: ko
+  task: transcribe
+  use_timestamps: false
+
+dataset:
+  path: /data/MyProject/stt/data-gen/aig-audio-3/data/processed/hf_dataset
+  audio_column: audio
+  text_column: text
+  train_split: train          # 기존 train -> 학습 (text only)
+  test_split: validation      # 기존 validation -> test (valid 없음)
+
+bias:
+  type: encoder_output
+  encoder_seq_len: 1500       # whisper 30s 고정 입력 기준
+  init: normal                # normal | zero
+  init_std: 0.02
+
+kv_bias:                      # exp02: direct K/V bias
+  mode: A                     # A(blend) | B(concat)
+  length: 1500               # mode A: 위치별 bias 길이
+  M: 32                      # mode B: memory slot 수
+  init_std: 0.02
+  learning_rate: 0.0003       # exp01 교훈: lr 낮춤
+  epochs: 3
+  alpha_grid: [1.0, 0.95, 0.9, 0.8, 0.7, 0.5]   # mode A 강도 (1.0=baseline sanity)
+  g_grid: [0.0, 0.25, 0.5, 1.0]                 # mode B 강도 (0=baseline sanity)
+
+training:
+  epochs: 5
+  batch_size: 8
+  learning_rate: 0.001
+  lr_grid: [0.001, 0.0003, 0.0001]
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  max_label_length: 448
+  save_steps: 200
+  log_steps: 20
+  seed: 42
+
+inference:
+  alphas: [1.0, 0.95, 0.9, 0.8, 0.7, 0.5]
+  beam_size: 1               # greedy (1차 빠른 검증). 운영 비교는 beam5로 별도
+  temperature: 0.0
+  condition_on_prev_tokens: false
+  max_audio_seconds: 30       # test의 30s 초과 chunk 처리 기준
+
+metrics:
+  normalize_text: true
+  compute_cer: true
+  compute_wer: true
+  compute_error_breakdown: true
+  compute_domain_terms: true
+  compute_hallucination_stats: true
+  length_ratio_threshold: 1.5
+  repeat_ngram: 5
+
+paths:
+  checkpoints: outputs/checkpoints
+  eval_reports: outputs/eval_reports

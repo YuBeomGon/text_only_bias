@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Experiment outputs / data (do NOT commit)
+text_only_bias/outputs/
+*.pt
+*.ckpt
+*.arrow
+*.jsonl
+*.zip
+*.log
+
+# Datasets (lives outside repo, never commit)
+**/hf_dataset/
+**/data/processed/
+
+# Reference papers (copyright)
+docs/assets/*.pdf
+
+# OS / editor
+.DS_Store
+*.swp
