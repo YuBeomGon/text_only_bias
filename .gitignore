@@ -21,6 +21,9 @@ text_only_bias/outputs/
 # Reference papers (copyright)
 docs/assets/*.pdf
 
+# Local agent / harness
+.claude/
+
 # OS / editor
 .DS_Store
 *.swp

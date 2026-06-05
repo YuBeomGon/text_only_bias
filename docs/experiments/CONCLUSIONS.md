@@ -2,17 +2,19 @@
 
 전체 실험(exp01, exp02 + 오라클)의 결론과, 사후 논문 정독으로 드러난 핵심 교훈을 정리한다.
 
-- 작성일: 2026-06-05
+- 작성일: 2026-06-05 / 갱신: 2026-06-06 (exp03 완료 반영)
 - 데이터: AIG 보험 통화 STT (train 2556 / test=validation 424), whisper-small, ko, beam1, test 120샘플
-- 개별 결과: [exp01](./exp01_encoder_output_bias/result.md) · [exp02](./exp02_kv_bias/result.md)
+- 개별 결과: [exp01](./exp01_encoder_output_bias/result.md) · [exp02](./exp02_kv_bias/result.md) · [exp03](./exp03_paper_faithful/result.md)
 
 ---
 
 ## 1. 한 줄 결론
 
-내가 시도한 **text-only로 학습한 "단일 글로벌 bias"를 cross-attention에 주입하는 방식은 baseline을
-개선하지 못했다.** 하지만 사후 논문 정독 결과 **논문의 핵심 디테일(B 초기화·decoder 학습)을 놓쳤음**이
-드러나, "방식이 안 된다"가 아니라 **"논문대로 안 했다"**로 봐야 한다. → 후속 exp03 권고.
+**text-only로 학습한 cross-attention bias를 주입하는 방식은 이 데이터·모델에서 baseline을 개선하지 못했다.**
+처음엔 "논문 디테일(B 초기화·decoder 학습) 미준수" 가능성을 의심해 exp03에서 **논문을 충실히 재현(MoE 제외)**
+했으나, E_pretrained 초기화도 decoder fine-tune도 실패 — init 단독은 무효, decoder full FT는 오히려 파국
+(train 때 K/V=B로 학습 → audio 추론과 불일치 + 과적합 → CER 5+·환각). 즉 **"논문 미준수"가 아니라 적어도
+이 재현 구성에서는 접근 자체의 한계**로 결론. 후속은 shallow fusion 등 per-token 경로(§5).
 
 ---
 
@@ -64,22 +66,35 @@
 
 ---
 
+## 4b. exp03 — 논문 충실 재현의 결과 (놓친 것을 채운 뒤)
+
+§4의 누락분(#1 init, #3 decoder FT)을 채워 논문을 충실히 재현(MoE 제외)했다. 게이팅·Bregman도 구현.
+test 120, alpha `[1.0,0.9,0.7,0.5]`, baseline 재사용. 상세: [exp03/result.md](./exp03_paper_faithful/result.md).
+
+| 단계 | 추가 | 결과 (baseline CER 0.2852) |
+|---|---|---|
+| P2 init-only | E_pretrained init(L2≈44, 스케일 해결) + B만 학습 | α1.0 baseline 일치(sanity✅), **α↓시 동일 붕괴 → init 단독 무효** |
+| P3 decoder FT | + decoder full FT (train loss 0.4) | **α1.0(bias OFF)서 이미 CER 5.08·길이 11배·반복 101/120 → 파국** |
+
+- **핵심 진단(P3)**: 학습은 K/V=B로 했는데 추론은 audio K/V → decoder가 "B 조건"에 적응해 audio와 어긋남
+  (train/infer 불일치) + 짧은 텍스트 과적합 → 환각 폭발. dt_recall 0.561은 도메인 단어 남발 착시(prec 0.384).
+- §4.1의 재정의(논문 K/V=encoder-output=exp01)는 유지. 단 #1/#3을 채운 뒤에도 개선 없음 →
+  **"논문 미준수" 가설은 기각**, 적어도 이 재현 구성에선 접근의 한계.
+
+---
+
 ## 5. 의사결정 / 다음 방향
 
 ### 확정 결론
-- **"단일 글로벌 text-only bias 주입(B만 학습)" 계열은 이 데이터에서 부적합** (exp01/02/oracle로 입증).
-- 데이터 증량은 이 방식엔 답이 아님(오라클이 부정).
+- **"text-only bias 주입" 계열(B만 학습 / +init / +decoder FT)은 이 데이터에서 부적합** (exp01/02/oracle/exp03로 입증).
+- 데이터 증량은 이 방식엔 답이 아님(오라클이 부정). 논문 디테일을 채워도 개선 없음(exp03).
 
-### 후속 권고 — exp03: 논문 충실 재현
-음성 결과의 원인이 "논문 미준수"일 수 있으므로, 닫기 전에 논문대로 재현:
-1. **B = E_pretrained 초기화** (train audio 일부를 encoder에 통과 → 초기값으로만 사용) ← 영향 1순위
-2. **decoder fine-tune** (또는 안전하게 LoRA) ← 오라클 한계 해소 기대
-3. (옵션) tanh 게이팅, Bregman loss
-- 평가/판정 기준은 동일(CER/WER↓ + domain term recall↑ + insertion 증가 없음).
-
-### 대안 (exp03도 실패 시)
-- **shallow fusion** (디코딩 시 도메인 LM logit 가산 — per-token 주소 있음, hallucination 통제 쉬움)
-- 운영 모델이 faster-whisper/CT2면 그 계열에서 재검증 (가이드 §7)
+### 후속 후보 — exp04 (이번 실패에서 도출)
+1. **train/infer 조건 일치**: decoder 학습 시 K/V를 `αK_audio+(1-α)B`로 섞어 추론과 동일 조건으로 학습 (P3 파국의 직접 원인 제거).
+2. **경량 FT**: decoder full 대신 **LoRA** + 더 적은 step + early stop (valid 부재 → train 일부를 dev로).
+3. **게이팅(코드 준비됨)**: gate가 해로운 B 성분 억제 → P2 붕괴 완화 가능(P3 손상은 못 살림).
+4. **shallow fusion** (디코딩 시 도메인 LM logit 가산 — per-token 주소 있음, hallucination 통제 쉬움) ← 유력.
+5. 운영 모델이 faster-whisper/CT2면 그 계열에서 재검증 (가이드 §7).
 
 ---
 
@@ -87,6 +102,7 @@
 
 - 검증된 파이프라인: `data.py`, `metrics.py`(CER/WER/breakdown/domain-term/hallucination), `report.py`,
   `eval_baseline.py`, forward-hook 주입(`kv_bias_model.py`), text-only 학습 루프.
-- 테스트 33 passed (sanity·gradient·shape 검증 포함).
+- 재사용 컴포넌트: `init_from_encoder`(E_pretrained init), tanh 게이팅(`use_gate`), Bregman 손실(`exp03/loss.py`).
+- 테스트 **44 passed** (sanity·gradient·shape + 게이팅5·Bregman5 포함).
 - baseline (whisper-small, beam1, test 120): CER 0.2852 / WER 0.5954 / dt_recall 0.501.
-- exp03은 이 위에 ①초기화 ②decoder 학습만 바꿔 빠르게 진입 가능.
+- exp04는 이 위에 train/infer 조건 일치·LoRA·shallow fusion만 얹어 진입 가능.
